@@ -1,0 +1,764 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description" : "CitusDB Community Edition with pg_shard and cstore_fdw",
+
+  "Parameters" : {
+    "MasterInstanceType" : {
+      "Description" : "EC2 instance type of the master node",
+      "Type" : "String",
+      "Default" : "r3.2xlarge",
+      "ConstraintDescription" : "must be a valid EC2 instance type.",
+      "AllowedValues"   : ["m3.medium","m3.large","m3.xlarge","m3.2xlarge","c3.large","c3.xlarge","c3.2xlarge","c3.4xlarge","c3.8xlarge","r3.large","r3.xlarge","r3.2xlarge","r3.4xlarge","r3.8large","g2.2xlarge","i2.xlarge","i2.2xlarge","i2.4xlarge","i2.8xlarge"]
+    },
+    "WorkerInstanceType" : {
+      "Description" : "EC2 instance type of the worker nodes",
+      "Type" : "String",
+      "Default" : "r3.2xlarge",
+      "ConstraintDescription" : "must be a valid EC2 instance type.",
+      "AllowedValues" : ["m3.medium","m3.large","m3.xlarge","m3.2xlarge","c3.large","c3.xlarge","c3.2xlarge","c3.4xlarge","c3.8xlarge","r3.large","r3.xlarge","r3.2xlarge","r3.4xlarge","r3.8large","g2.2xlarge","i2.xlarge","i2.2xlarge","i2.4xlarge","i2.8xlarge"]
+    },
+    "KeyName" : {
+      "Description" : "The EC2 Key Pair to allow SSH access to the instances",
+      "Type" : "AWS::EC2::KeyPair::KeyName"
+    },
+    "NumWorkers" : {
+      "Description" : "The number of worker instances (up to 6 using CitusDB Community Edition)",
+      "Type" : "Number",
+      "Default" : "2",
+      "MinValue" : 1,
+      "MaxValue" : 6
+    },
+    "AvailabilityZone" : {
+      "Description" : "The availability zone to launch the cluster in",
+      "Type" : "AWS::EC2::AvailabilityZone::Name"
+    }
+  },
+
+  "Resources": {
+
+    "VPC": {
+      "Type": "AWS::EC2::VPC",
+      "Properties": {
+        "CidrBlock": "10.0.0.0/16",
+        "EnableDnsSupport": true,
+        "EnableDnsHostnames": true,
+        "InstanceTenancy": "default",
+        "Tags": [ {
+          "Key": "Name",
+          "Value": { "Fn::Join" : [ "-", [ { "Ref": "AWS::StackName" }, "VPC" ] ] }
+        } ]
+      }
+    },
+
+    "InternetGateway": {
+      "Type": "AWS::EC2::InternetGateway",
+      "Properties": {
+        "Tags": [ {
+          "Key": "Name",
+          "Value": { "Fn::Join" : [ "-", [ { "Ref": "AWS::StackName" }, "InternetGateway" ] ] }
+        } ]
+      }
+    },
+
+    "InternetGatewayAttachment": {
+      "Type": "AWS::EC2::VPCGatewayAttachment",
+      "Properties": {
+        "VpcId": { "Ref": "VPC" },
+        "InternetGatewayId": { "Ref": "InternetGateway" }
+      }
+    },
+
+    "Subnet": {
+      "Type": "AWS::EC2::Subnet",
+      "Properties": {
+        "AvailabilityZone": {
+          "Fn::Select": [ 0, { "Fn::GetAZs": { "Ref": "AWS::Region" } } ]
+        },
+        "CidrBlock": "10.0.0.0/16",
+        "MapPublicIpOnLaunch": true,
+        "Tags": [ {
+          "Key": "Name",
+          "Value": { "Fn::Join" : [ "-", [ { "Ref": "AWS::StackName" }, "Subnet" ] ] }
+        } ],
+        "VpcId": { "Ref": "VPC" }
+      }
+    },
+
+    "RouteTable": {
+      "Type": "AWS::EC2::RouteTable",
+      "Properties": {
+        "VpcId": { "Ref": "VPC" },
+        "Tags": [ {
+          "Key": "Name",
+          "Value": { "Fn::Join" : [ "-", [ { "Ref": "AWS::StackName" }, "RouteTable" ] ] }
+        } ]
+      }
+    },
+
+    "RouteTableRoute": {
+      "Type": "AWS::EC2::Route",
+      "Properties": {
+        "RouteTableId": { "Ref": "RouteTable" },
+        "DestinationCidrBlock": "0.0.0.0/0",
+        "GatewayId": { "Ref": "InternetGateway" }
+      }
+    },
+
+    "RouteTableSubnetAssociation": {
+      "Type": "AWS::EC2::SubnetRouteTableAssociation",
+      "Properties": {
+        "RouteTableId": { "Ref": "RouteTable" },
+        "SubnetId": { "Ref": "Subnet" }
+      }
+    },
+
+    "CitusDBSecurityGroup" : {
+      "Type" : "AWS::EC2::SecurityGroup",
+      "Properties" : {
+        "GroupDescription" : "CitusDB cluster",
+        "SecurityGroupIngress" : [{
+          "IpProtocol" : "tcp",
+          "FromPort" : "22",
+          "ToPort" : "22",
+          "CidrIp" : "0.0.0.0/0"
+        }],
+        "VpcId": { "Ref": "VPC" }
+      }
+    },
+
+    "CitusDBIngress": {
+      "Type": "AWS::EC2::SecurityGroupIngress",
+      "Properties": {
+        "GroupId": {"Ref":"CitusDBSecurityGroup"},
+        "IpProtocol": "tcp",
+        "FromPort": "5432",
+        "ToPort": "5432",
+        "SourceSecurityGroupId": {"Ref":"CitusDBSecurityGroup"}
+      }
+    },
+
+    "MasterSecurityGroup" : {
+      "Type" : "AWS::EC2::SecurityGroup",
+      "Properties" : {
+        "GroupDescription" : "CitusDB master",
+        "SecurityGroupIngress" : [],
+        "VpcId": { "Ref": "VPC" }
+      }
+    },
+
+    "MasterInstance" : {
+       "Type" : "AWS::EC2::Instance",
+       "DependsOn" : "WorkerStartCondition",
+
+       "Metadata" : {
+          "AWS::CloudFormation::Init" : {
+            "config" : {
+              "packages" : {
+                "rpm" : {
+                  "citusdb"          : {"Fn::FindInMap" : [ "Constants", "RPMs", "CitusDB"]},
+                  "contrib"          : {"Fn::FindInMap" : [ "Constants", "RPMs", "Contrib"]}
+                },
+                "yum" : {
+                  "sysstat"          : [],
+                  "iotop"            : [],
+                  "iftop"            : [],
+                  "htop"             : [],
+                  "protobuf-c-devel" : []
+                }
+              },
+              "sources" : {
+                 "/tmp/cstore_fdw" : {"Fn::FindInMap" : [ "Constants", "Sources", "cstore"]}
+              },
+              "files" : {
+                "/home/ec2-user/postgresql.conf" : {
+                   "source" : {"Fn::FindInMap" : [ "Constants", "PostgreSQLConf", "Master"]},
+                   "mode"   : "000644", "owner"  : "ec2-user", "group"  : "ec2-user"
+                },
+                "/home/ec2-user/bin/find-workers" : {
+                   "source" : {"Fn::FindInMap" : [ "Constants", "Scripts", "FindWorkers"]},
+                   "mode"   : "000755", "owner"  : "ec2-user", "group"  : "ec2-user"
+                },
+                "/home/ec2-user/bin/install-cstore" : {
+                   "source" : {"Fn::FindInMap" : [ "Constants", "Scripts", "InstallCStore"]},
+                   "mode"   : "000755", "owner"  : "ec2-user", "group"  : "ec2-user"
+                },
+                "/etc/motd" : {
+                   "source" : {"Fn::FindInMap" : [ "Constants", "Scripts", "MOTD"]},
+                   "mode"   : "000755", "owner"  : "ec2-user", "group"  : "ec2-user"
+                },
+                "/home/ec2-user/worker-as-group.txt" : {
+                   "content": { "Fn::Join" : ["", [
+                       {"Ref":"WorkerGroup"}, "\n"
+                   ]]},
+                   "mode"   : "000644", "owner"  : "ec2-user", "group"  : "ec2-user"
+                },
+                "/etc/security/limits.d/fdlimits.conf" : {
+                   "content": { "Fn::Join" : ["", [
+                     "ec2-user soft nofile 8192\n",
+                     "ec2-user hard nofile 65535\n"
+                   ]]},
+                   "mode"   : "000644", "owner"  : "root", "group"  : "root"
+                },
+                "/usr/bin/data-disk-setup.sh" : {
+                   "source" : {"Fn::FindInMap" : [ "Constants", "Scripts", "DiskSetup"]},
+                   "mode"   : "000755"
+                }
+              },
+              "commands" : {
+                "01-disk-setup" : {
+                  "command" : "/usr/bin/data-disk-setup.sh",
+                  "env" : {
+                    "NUM_DRIVES" : "1"
+                  }
+                },
+                "05-set-path" : {
+                    "command" : "echo 'export PATH=/opt/citusdb/4.0/bin/:$PATH PGHOST=localhost PGDATABASE=postgres' >> /home/ec2-user/.bashrc"
+                },
+                "10-install-cstore" : {
+                  "command" : "/home/ec2-user/bin/install-cstore"
+                },
+                "15-init-db" : {
+                  "command" : "su ec2-user -c \"/opt/citusdb/4.0/bin/initdb -D /data/base/\""
+                },
+                "16-set-workers" : {
+                  "command" : "su ec2-user -c \"/home/ec2-user/bin/find-workers\"",
+                  "env" : {
+                    "AWS_DEFAULT_REGION" : {"Ref":"AWS::Region"},
+                    "WORKER_AS_GROUP"    : {"Ref":"WorkerGroup"},
+                    "DB_LOCATION"        : "/data/base"
+                  }
+                },
+                "18-set-config" : {
+                  "command" : "cp -f /home/ec2-user/postgresql.conf /data/base/postgresql.conf"
+                },
+                "19-allow-access" : {
+                  "command" : "echo host all all 10.0.0.0/16 trust >> /data/base/pg_hba.conf"
+                },
+                "20-start-citus-db" : {
+                  "command" : "su ec2-user -c \"/opt/citusdb/4.0/bin/pg_ctl -D /data/base/ -l /tmp/logfile -w start\""
+                },
+                "22-enable-cstore" : {
+                  "command" : "/opt/citusdb/4.0/bin/psql -h localhost -d postgres -U ec2-user -c 'CREATE EXTENSION IF NOT EXISTS cstore_fdw;'"
+                },
+                "23-enable-pgshard" : {
+                  "command" : "/opt/citusdb/4.0/bin/psql -h localhost -d postgres -U ec2-user -c 'CREATE EXTENSION IF NOT EXISTS pg_shard;'"
+                },
+                "24-enable-hll" : {
+                  "command" : "/opt/citusdb/4.0/bin/psql -h localhost -d postgres -U ec2-user -c 'CREATE EXTENSION IF NOT EXISTS hll;'"
+                },
+                "25-enable-hstore" : {
+                  "command" : "/opt/citusdb/4.0/bin/psql -h localhost -d postgres -U ec2-user -c 'CREATE EXTENSION IF NOT EXISTS hstore;'"
+                },
+                "26-enable-shard-rebalancer" : {
+                  "command" : "/opt/citusdb/4.0/bin/psql -h localhost -d postgres -U ec2-user -c 'CREATE EXTENSION IF NOT EXISTS shard_rebalancer;'"
+                },
+                "35-start-citus-db-on-restart" : {
+                  "command" : "echo 'su ec2-user -c \"/opt/citusdb/4.0/bin/pg_ctl -D /data/base/ -l /tmp/logfile start\"' >> /etc/rc.d/rc.local"
+                },
+                "90-signal-done" : {
+                  "command" : { "Fn::Join" : ["", [ "/opt/aws/bin/cfn-signal -e 0 -r MasterInstance '", { "Ref" : "MasterWaitHandle" }, "'" ]] }
+                }
+              }
+            }
+          }
+       },
+       "Properties" : {
+          "SubnetId": { "Ref": "Subnet" },
+          "ImageId" : {"Fn::FindInMap" : [ "AmazonLinuxEBSAMIs", {"Ref":"AWS::Region"}, {"Fn::FindInMap" : [ "InstanceTypes", {"Ref":"MasterInstanceType"}, "Architecture"]}]},
+          "InstanceType" : {"Ref":"MasterInstanceType"},
+          "KeyName" : {"Ref":"KeyName"},
+          "SecurityGroupIds" : [{"Ref":"CitusDBSecurityGroup"},{"Ref":"MasterSecurityGroup"}],
+          "Tags" : [
+            { "Key" : "Name", "Value" : "citusdb-master" }
+          ],
+          "IamInstanceProfile": { "Ref":"RootInstanceProfile" },
+          "BlockDeviceMappings" : [
+              {"DeviceName" : "/dev/sdb", "Ebs" : { "VolumeSize" : {"Fn::FindInMap" : [ "Constants", "VolumeSize", "Master"]}, "VolumeType" : "gp2" }}
+          ],
+          "UserData" : { "Fn::Base64" : { "Fn::Join" : ["", [
+              "#!/bin/bash -v\n",
+              "sed -i '0,/enabled=/{s/enabled=0/enabled=1/}' /etc/yum.repos.d/epel.repo\n",
+              "echo timeout=60 >> /etc/yum.conf\n",
+              "echo retries=20 >> /etc/yum.conf\n",
+
+              "yum update -y -q aws-cfn-bootstrap\n",
+              "yum groupinstall -y -q \"Development tools\"\n",
+
+              "function handle_error\n",
+              "{\n",
+                "ERR_FILE=$(mktemp)\n",
+                "(grep ERROR /var/log/cfn-init.log | sed -e 's/^.*] //' >> $ERR_FILE) || true\n",
+                "(tac /var/log/cfn-init-cmd.log | grep -m 1 -B 100 ==== | tac | sed -e 's/^.*] //' -e '/^=*$/d' >> $ERR_FILE) || true\n",
+                "/opt/aws/bin/cfn-signal -s false -e $1 -r \"Output: `cat $ERR_FILE`\" '", { "Ref":"MasterWaitHandle" }, "'\n",
+              "  exit 1\n",
+              "}\n",
+
+              "trap 'handle_error $? ${LINENO}' ERR\n",
+
+              "/opt/aws/bin/cfn-init -s ", { "Ref" : "AWS::StackName" }, " -r MasterInstance ",
+              "    --region ", { "Ref" : "AWS::Region" }, "\n"
+          ]]}}
+        }
+    },
+
+    "MasterWaitHandle" : {
+        "Type" : "AWS::CloudFormation::WaitConditionHandle"
+    },
+
+    "MasterWaitCondition" : {
+        "Type" : "AWS::CloudFormation::WaitCondition",
+        "DependsOn" : "MasterInstance",
+        "Properties" : {
+            "Handle"  : {"Ref":"MasterWaitHandle"},
+            "Timeout" : "900",
+            "Count"   : "1"
+        }
+    },
+
+    "WorkerGroup" : {
+      "Type" : "AWS::AutoScaling::AutoScalingGroup",
+      "Properties" : {
+        "VPCZoneIdentifier": [ { "Ref": "Subnet" } ],
+        "LaunchConfigurationName" : { "Ref" : "WorkerLaunchConfig" },
+        "MinSize" : {"Ref":"NumWorkers"},
+        "MaxSize" : {"Ref":"NumWorkers"},
+        "Tags" : [
+          { "Key" : "Name", "Value" : "citusdb-worker", "PropagateAtLaunch" : "true" }
+        ]
+      }
+    },
+
+    "WorkerLaunchConfig" : {
+      "Type" : "AWS::AutoScaling::LaunchConfiguration",
+      "Metadata" : {
+        "AWS::CloudFormation::Init" : {
+           "config" : {
+              "packages" : {
+                "rpm" : {
+                  "citusdb"          : {"Fn::FindInMap" : [ "Constants", "RPMs", "CitusDB"]},
+                  "contrib"          : {"Fn::FindInMap" : [ "Constants", "RPMs", "Contrib"]}
+                },
+                "yum" : {
+                  "sysstat"          : [],
+                  "iotop"            : [],
+                  "iftop"            : [],
+                  "htop"             : [],
+                  "protobuf-c-devel" : []
+                }
+              },
+              "sources" : {
+                 "/tmp/cstore_fdw" : {"Fn::FindInMap" : [ "Constants", "Sources", "cstore"]}
+              },
+              "files" : {
+                "/home/ec2-user/postgresql.conf" : {
+                   "source" : {"Fn::FindInMap" : [ "Constants", "PostgreSQLConf", "Worker"]},
+                   "mode"   : "000644",
+                   "owner"  : "ec2-user",
+                   "group"  : "ec2-user"
+                },
+                "/home/ec2-user/bin/install-cstore" : {
+                   "source" : {"Fn::FindInMap" : [ "Constants", "Scripts", "InstallCStore"]},
+                   "mode"   : "000755",
+                   "owner"  : "ec2-user",
+                   "group"  : "ec2-user"
+                },
+                "/etc/motd" : {
+                   "source" : {"Fn::FindInMap" : [ "Constants", "Scripts", "MOTD"]},
+                   "mode"   : "000755", "owner"  : "ec2-user", "group"  : "ec2-user"
+                },
+                "/etc/security/limits.d/fdlimits.conf" : {
+                   "content": { "Fn::Join" : ["", [
+                     "ec2-user soft nofile 8192\n",
+                     "ec2-user hard nofile 65535\n"
+                   ]]},
+                   "mode"   : "000644",
+                   "owner"  : "root",
+                   "group"  : "root"
+                },
+                "/usr/bin/data-disk-setup.sh" : {
+                   "source" : {"Fn::FindInMap" : [ "Constants", "Scripts", "DiskSetup"]},
+                   "mode"   : "000755"
+                }
+              },
+              "commands" : {
+                "01-disk-setup" : {
+                  "command" : "/usr/bin/data-disk-setup.sh",
+                  "env" : {
+                    "NUM_DRIVES" : {"Fn::FindInMap" : [ "InstanceTypes", {"Ref":"WorkerInstanceType"}, "NumEphemerals"]},
+                    "RAID_LEVEL" : {"Fn::FindInMap" : [ "DriveSetup", {"Fn::FindInMap" : [ "InstanceTypes", {"Ref":"WorkerInstanceType"}, "NumEphemerals"]}, "RAIDLevel"]}
+                  }
+                },
+                "05-set-path" : {
+                    "command" : "echo 'export PATH=/opt/citusdb/4.0/bin/:$PATH PGHOST=localhost PGDATABASE=postgres' >> /home/ec2-user/.bashrc"
+                },
+                "10-install-cstore" : {
+                  "command" : "/home/ec2-user/bin/install-cstore"
+                },
+                "15-init-db" : {
+                  "command" : "su ec2-user -c \"/opt/citusdb/4.0/bin/initdb -D /data/base/\""
+                },
+                "18-set-config" : {
+                  "command" : "cp -f /home/ec2-user/postgresql.conf /data/base/postgresql.conf"
+                },
+                "19-allow-access" : {
+                  "command" : "echo host all all 10.0.0.0/16 trust >> /data/base/pg_hba.conf"
+                },
+                "20-start-citus-db" : {
+                  "command" : "su ec2-user -c \"/opt/citusdb/4.0/bin/pg_ctl -D /data/base/ -l /tmp/logfile -w start\""
+                },
+                "22-enable-cstore" : {
+                  "command" : "/opt/citusdb/4.0/bin/psql -h localhost -d postgres -U ec2-user -c 'CREATE EXTENSION IF NOT EXISTS cstore_fdw;'"
+                },
+                "23-enable-pgshard" : {
+                  "command" : "/opt/citusdb/4.0/bin/psql -h localhost -d postgres -U ec2-user -c 'CREATE EXTENSION IF NOT EXISTS pg_shard;'"
+                },
+                "24-enable-hll" : {
+                  "command" : "/opt/citusdb/4.0/bin/psql -h localhost -d postgres -U ec2-user -c 'CREATE EXTENSION IF NOT EXISTS hll;'"
+                },
+                "25-enable-hstore" : {
+                  "command" : "/opt/citusdb/4.0/bin/psql -h localhost -d postgres -U ec2-user -c 'CREATE EXTENSION IF NOT EXISTS hstore;'"
+                },
+                "26-enable-shard-rebalancer" : {
+                  "command" : "/opt/citusdb/4.0/bin/psql -h localhost -d postgres -U ec2-user -c 'CREATE EXTENSION IF NOT EXISTS shard_rebalancer;'"
+                },
+                "35-start-citus-db-on-restart" : {
+                  "command" : "echo 'su ec2-user -c \"/opt/citusdb/4.0/bin/pg_ctl -D /data/base/ -l /tmp/logfile start\"' >> /etc/rc.d/rc.local"
+                },
+                "90-signal-done" : {
+                  "command" : { "Fn::Join" : ["", [ "/opt/aws/bin/cfn-signal -e 0 -r WorkerInstance '", { "Ref" : "WorkerStartHandle" }, "'" ]] }
+                }
+              }
+           }
+        }
+      },
+      "Properties" : {
+        "InstanceType" : {"Ref":"WorkerInstanceType"},
+        "ImageId" : {"Fn::FindInMap" : [ "AmazonLinuxEBSAMIs", {"Ref":"AWS::Region"}, {"Fn::FindInMap" : [ "InstanceTypes", {"Ref":"WorkerInstanceType"}, "Architecture"]}]},
+        "KeyName" : {"Ref":"KeyName"},
+        "SecurityGroups" : [{"Ref":"CitusDBSecurityGroup"}],
+        "IamInstanceProfile": { "Ref":"RootInstanceProfile" },
+        "BlockDeviceMappings" :
+        {"Fn::If": ["WorkerHas1Drive",
+           [{"DeviceName" : "/dev/sdb", "VirtualName": "ephemeral0" },
+            {"DeviceName" : "/dev/sdp", "Ebs" : { "VolumeSize" : {"Fn::FindInMap" : [ "Constants", "VolumeSize", "Worker"]}, "VolumeType" : "gp2" }}],
+
+        {"Fn::If": ["WorkerHas2Drives",
+           [{"DeviceName" : "/dev/sdb", "VirtualName": "ephemeral0" },
+            {"DeviceName" : "/dev/sdc", "VirtualName": "ephemeral1" },
+            {"DeviceName" : "/dev/sdp", "Ebs" : { "VolumeSize" : {"Fn::FindInMap" : [ "Constants", "VolumeSize", "Worker"]}, "VolumeType" : "gp2" }}],
+
+        {"Fn::If": ["WorkerHas4Drives",
+           [{"DeviceName" : "/dev/sdb", "VirtualName": "ephemeral0" },
+            {"DeviceName" : "/dev/sdc", "VirtualName": "ephemeral1" },
+            {"DeviceName" : "/dev/sdd", "VirtualName": "ephemeral2" },
+            {"DeviceName" : "/dev/sde", "VirtualName": "ephemeral3" },
+            {"DeviceName" : "/dev/sdp", "Ebs" : { "VolumeSize" : {"Fn::FindInMap" : [ "Constants", "VolumeSize", "Worker"]}, "VolumeType" : "gp2" }}],
+
+        {"Fn::If": ["WorkerHas8Drives",
+           [{"DeviceName" : "/dev/sdb", "VirtualName": "ephemeral0" },
+            {"DeviceName" : "/dev/sdc", "VirtualName": "ephemeral1" },
+            {"DeviceName" : "/dev/sdd", "VirtualName": "ephemeral2" },
+            {"DeviceName" : "/dev/sde", "VirtualName": "ephemeral3" },
+            {"DeviceName" : "/dev/sdf", "VirtualName": "ephemeral4" },
+            {"DeviceName" : "/dev/sdg", "VirtualName": "ephemeral5" },
+            {"DeviceName" : "/dev/sdh", "VirtualName": "ephemeral6" },
+            {"DeviceName" : "/dev/sdi", "VirtualName": "ephemeral7" },
+            {"DeviceName" : "/dev/sdp", "Ebs" : { "VolumeSize" : {"Fn::FindInMap" : [ "Constants", "VolumeSize", "Worker"]}, "VolumeType" : "gp2" }}],
+
+           [{"DeviceName" : "/dev/sdb", "Ebs" : { "VolumeSize" : {"Fn::FindInMap" : [ "Constants", "VolumeSize", "Worker"]}, "VolumeType" : "gp2" }},
+            {"DeviceName" : "/dev/sdp", "Ebs" : { "VolumeSize" : {"Fn::FindInMap" : [ "Constants", "VolumeSize", "Worker"]}, "VolumeType" : "gp2" }}]
+
+        ]}
+        ]}
+        ]}
+        ]},
+        "UserData" : { "Fn::Base64" : { "Fn::Join" : ["", [
+          "#!/bin/bash -v\n",
+          "sed -i '0,/enabled=/{s/enabled=0/enabled=1/}' /etc/yum.repos.d/epel.repo\n",
+          "echo timeout=60 >> /etc/yum.conf\n",
+          "echo retries=20 >> /etc/yum.conf\n",
+
+          "yum update -y -q aws-cfn-bootstrap\n",
+          "yum groupinstall -y -q \"Development tools\"\n",
+
+          "function handle_error\n",
+          "{\n",
+            "ERR_FILE=$(mktemp)\n",
+            "(grep ERROR /var/log/cfn-init.log | sed -e 's/^.*] //' >> $ERR_FILE) || true\n",
+            "(tac /var/log/cfn-init-cmd.log | grep -m 1 -B 100 ==== | tac | sed -e 's/^.*] //' -e '/^=*$/d' >> $ERR_FILE) || true\n",
+            "/opt/aws/bin/cfn-signal -s false -e $1 -r \"Output: `cat $ERR_FILE`\" '", { "Ref":"WorkerStartHandle" }, "'\n",
+            "exit 1\n",
+          "}\n",
+
+          "trap 'handle_error $? ${LINENO}' ERR\n",
+
+          "mkfs -t ext4 /dev/sdp > /dev/null\n",
+          "mkdir /stage\n",
+          "mount /dev/sdp /stage\n",
+          "chown ec2-user:ec2-user /stage\n",
+
+          "/opt/aws/bin/cfn-init -s ", { "Ref" : "AWS::StackName" }, " -r WorkerLaunchConfig ",
+          "    --region ", { "Ref" : "AWS::Region" }, "\n"
+        ]]}}
+      }
+    },
+
+    "WorkerStartHandle" : {
+        "Type" : "AWS::CloudFormation::WaitConditionHandle"
+    },
+
+    "WorkerStartCondition" : {
+        "Type" : "AWS::CloudFormation::WaitCondition",
+        "DependsOn" : "WorkerGroup",
+        "Properties" : {
+            "Handle"  : {"Ref":"WorkerStartHandle"},
+            "Timeout" : "1800",
+            "Count"   : {"Ref":"NumWorkers"}
+        }
+    },
+
+    "MainRole": {
+       "Type": "AWS::IAM::Role",
+       "Properties": {
+          "AssumeRolePolicyDocument": {
+             "Statement": [ {
+                "Effect": "Allow",
+                "Principal": {
+                   "Service": [ "ec2.amazonaws.com" ]
+                },
+                "Action": [ "sts:AssumeRole" ]
+             }]
+          },
+          "Path": "/"
+       }
+    },
+    "RolePolicies": {
+       "Type": "AWS::IAM::Policy",
+       "Properties": {
+          "PolicyName": { "Fn::Join" : [ "_", ["citus-policy", { "Ref":"AWS::Region" }] ] },
+          "PolicyDocument": {
+             "Statement": [
+             {
+                "Sid": "stm5",
+                "Action": [
+                  "autoscaling:DescribeAutoScalingGroups"
+                ],
+                "Effect": "Allow",
+                "Resource": [
+                  "*"
+                ]
+             },
+             {
+                "Sid": "stm10",
+                "Action": [
+                  "ec2:DescribeInstances"
+                ],
+                "Effect": "Allow",
+                "Resource": [
+                  "*"
+                ]
+             },
+             {
+                "Sid": "stm20",
+                "Action": [
+                  "cloudformation:DescribeStacks"
+                ],
+                "Effect": "Allow",
+                "Resource": [
+                  "*"
+                ]
+             }
+          ]},
+          "Roles": [ { "Ref":"MainRole" } ]
+       }
+    },
+    "RootInstanceProfile": {
+       "Type": "AWS::IAM::InstanceProfile",
+       "Properties": {
+          "Path": "/",
+          "Roles": [ { "Ref":"MainRole" } ]
+        }
+    }
+  },
+
+  "Conditions" : {
+    "WorkerHas0Drives" : {"Fn::Equals" : [{"Fn::FindInMap" : [ "InstanceTypes", {"Ref":"WorkerInstanceType"}, "NumEphemerals"]}, "0"] },
+    "WorkerHas1Drive"  : {"Fn::Equals" : [{"Fn::FindInMap" : [ "InstanceTypes", {"Ref":"WorkerInstanceType"}, "NumEphemerals"]}, "1"] },
+    "WorkerHas2Drives" : {"Fn::Equals" : [{"Fn::FindInMap" : [ "InstanceTypes", {"Ref":"WorkerInstanceType"}, "NumEphemerals"]}, "2"] },
+    "WorkerHas4Drives" : {"Fn::Equals" : [{"Fn::FindInMap" : [ "InstanceTypes", {"Ref":"WorkerInstanceType"}, "NumEphemerals"]}, "4"] },
+    "WorkerHas8Drives" : {"Fn::Equals" : [{"Fn::FindInMap" : [ "InstanceTypes", {"Ref":"WorkerInstanceType"}, "NumEphemerals"]}, "8"] }
+  },
+
+  "Mappings" : {
+    "InstanceTypes" : {
+      "m3.medium" : {
+        "NumEphemerals" : "1",
+        "Architecture"  : "64PV",
+        "NumCores"      : "1",
+        "NumVCPUs"      : "1"
+      },
+      "m3.large" : {
+        "NumEphemerals" : "1",
+        "Architecture"  : "64PV",
+        "NumCores"      : "1",
+        "NumVCPUs"      : "2"
+      },
+      "m3.xlarge" : {
+        "NumEphemerals" : "2",
+        "Architecture"  : "64PV",
+        "NumCores"      : "2",
+        "NumVCPUs"      : "4"
+      },
+      "m3.2xlarge" : {
+        "NumEphemerals" : "2",
+        "Architecture"  : "64PV",
+        "NumCores"      : "4",
+        "NumVCPUs"      : "8"
+      },
+      "c3.large" : {
+        "NumEphemerals" : "2",
+        "Architecture"  : "64PV",
+        "NumCores"      : "1",
+        "NumVCPUs"      : "2"
+      },
+      "c3.xlarge" : {
+        "NumEphemerals" : "2",
+        "Architecture"  : "64PV",
+        "NumCores"      : "2",
+        "NumVCPUs"      : "4"
+      },
+      "c3.2xlarge" : {
+        "NumEphemerals" : "2",
+        "Architecture"  : "64PV",
+        "NumCores"      : "4",
+        "NumVCPUs"      : "8"
+      },
+      "c3.4xlarge" : {
+        "NumEphemerals" : "2",
+        "Architecture"  : "64PV",
+        "NumCores"      : "8",
+        "NumVCPUs"      : "16"
+      },
+      "c3.8xlarge" : {
+        "NumEphemerals" : "2",
+        "Architecture"  : "64PV",
+        "NumCores"      : "16",
+        "NumVCPUs"      : "32"
+      },
+      "r3.large" : {
+        "NumEphemerals" : "1",
+        "Architecture"  : "64HVM",
+        "NumCores"      : "1",
+        "NumVCPUs"      : "2"
+      },
+      "r3.xlarge" : {
+        "NumEphemerals" : "1",
+        "Architecture"  : "64HVM",
+        "NumCores"      : "2",
+        "NumVCPUs"      : "4"
+      },
+      "r3.2xlarge" : {
+        "NumEphemerals" : "1",
+        "Architecture"  : "64HVM",
+        "NumCores"      : "4",
+        "NumVCPUs"      : "8"
+      },
+      "r3.4xlarge" : {
+        "NumEphemerals" : "1",
+        "Architecture"  : "64HVM",
+        "NumCores"      : "8",
+        "NumVCPUs"      : "16"
+      },
+      "r3.8xlarge" : {
+        "NumEphemerals" : "2",
+        "Architecture"  : "64HVM",
+        "NumCores"      : "16",
+        "NumVCPUs"      : "32"
+      },
+      "g2.2xlarge" : {
+        "NumEphemerals" : "1",
+        "Architecture"  : "64HVM",
+        "NumCores"      : "4",
+        "NumVCPUs"      : "8"
+      },
+      "i2.xlarge" : {
+        "NumEphemerals" : "1",
+        "Architecture"  : "64HVM",
+        "NumCores"      : "2",
+        "NumVCPUs"      : "4"
+      },
+      "i2.2xlarge" : {
+        "NumEphemerals" : "2",
+        "Architecture"  : "64HVM",
+        "NumCores"      : "4",
+        "NumVCPUs"      : "8"
+      },
+      "i2.4xlarge" : {
+        "NumEphemerals" : "4",
+        "Architecture"  : "64HVM",
+        "NumCores"      : "8",
+        "NumVCPUs"      : "16"
+      },
+      "i2.8xlarge" : {
+        "NumEphemerals" : "8",
+        "Architecture"  : "64HVM",
+        "NumCores"      : "16",
+        "NumVCPUs"      : "32"
+      }
+    },
+
+    "AmazonLinuxEBSAMIs" : {
+      "us-east-1"       : { "64HVM" : "ami-1ecae776", "64PV" : "ami-1ccae774" },
+      "us-west-2"       : { "64HVM" : "ami-e7527ed7", "64PV" : "ami-ff527ecf" },
+      "us-west-1"       : { "64HVM" : "ami-d114f295", "64PV" : "ami-d514f291" },
+      "eu-west-1"       : { "64HVM" : "ami-a10897d6", "64PV" : "ami-bf0897c8" },
+      "eu-central-1"    : { "64HVM" : "ami-a8221fb5", "64PV" : "ami-ac221fb1" },
+      "ap-southeast-1"  : { "64HVM" : "ami-68d8e93a", "64PV" : "ami-acd9e8fe" },
+      "ap-northeast-1"  : { "64HVM" : "ami-cbf90ecb", "64PV" : "ami-27f90e27" },
+      "ap-southeast-2"  : { "64HVM" : "ami-fd9cecc7", "64PV" : "ami-ff9cecc5" },
+      "sa-east-1"       : { "64HVM" : "ami-b52890a8", "64PV" : "ami-bb2890a6" },
+      "cn-north-1"      : { "64HVM" : "ami-f239abcb", "64PV" : "ami-fa39abc3" },
+      "us-gov-west-1"   : { "64HVM" : "ami-41b2d362", "64PV" : "ami-47b2d364" }
+    },
+
+    "DriveSetup" : {
+      "0" : { "RAIDLevel" :  "0" },
+      "1" : { "RAIDLevel" :  "0" },
+      "2" : { "RAIDLevel" :  "0" },
+      "4" : { "RAIDLevel" : "10" },
+      "8" : { "RAIDLevel" : "10" }
+    },
+
+    "Constants" : {
+      "PostgreSQLConf" : {
+          "Master"         : "https://citus-deployment.s3.amazonaws.com/aws/2015-03-17/config/postgresql.conf",
+          "Worker"         : "https://citus-deployment.s3.amazonaws.com/aws/2015-03-17/config/postgresql.conf"
+      },
+      "RPMs" : {
+          "CitusDB"        : "https://citus-deployment.s3.amazonaws.com/aws/2015-03-17/packages/citusdb-4.0.1-1.x86_64.rpm",
+          "Contrib"        : "https://citus-deployment.s3.amazonaws.com/aws/2015-03-17/packages/citusdb-contrib-4.0.1-1.x86_64.rpm"
+      },
+      "Sources" : {
+          "cstore"         : "https://github.com/citusdata/cstore_fdw/archive/master.zip"
+      },
+      "Scripts" : {
+          "InstallCStore"  : "https://citus-deployment.s3.amazonaws.com/aws/2015-03-17/scripts/install-cstore.sh",
+          "DiskSetup"      : "https://citus-deployment.s3.amazonaws.com/aws/2015-03-17/scripts/disk-setup.sh",
+          "FindWorkers"    : "https://citus-deployment.s3.amazonaws.com/aws/2015-03-17/scripts/find-as-workers.sh",
+          "MOTD"           : "https://citus-deployment.s3.amazonaws.com/aws/2015-03-17/misc/motd.txt"
+      },
+      "VolumeSize" : {
+          "Master"         : "128",
+          "Worker"         : "128"
+      }
+    }
+  },
+
+  "Outputs" : {
+    "MasterHostname" : {
+      "Value"       : { "Fn::GetAtt" : [ "MasterInstance", "PublicDnsName" ]},
+      "Description" : "Hostname for master"
+    }
+  }
+
+}
